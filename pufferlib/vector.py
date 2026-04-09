@@ -162,6 +162,19 @@ class Serial:
         for env in self.envs:
             env.notify()
 
+    def get_expert_actions(self):
+        if not hasattr(self.driver_env, "get_expert_actions"):
+            raise AttributeError("Underlying environment does not expose get_expert_actions")
+
+        action_batches = []
+        valid_batches = []
+        for env in self.envs:
+            actions, valid = env.get_expert_actions()
+            action_batches.append(actions)
+            valid_batches.append(valid)
+
+        return np.concatenate(action_batches, axis=0), np.concatenate(valid_batches, axis=0)
+
     def recv(self):
         recv_precheck(self)
         return (

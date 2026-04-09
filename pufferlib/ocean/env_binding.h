@@ -707,6 +707,120 @@ static PyObject *vec_get_scenario_ids(PyObject *self, PyObject *args) {
     return list;
 }
 
+static PyObject *get_expert_actions(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "get_expert_actions requires 3 arguments");
+        return NULL;
+    }
+
+    Env *env = unpack_env(args);
+    if (!env) {
+        return NULL;
+    }
+
+    Drive *drive = (Drive *)env;
+    PyObject *actions_arr = PyTuple_GetItem(args, 1);
+    PyObject *valid_arr = PyTuple_GetItem(args, 2);
+
+    if (!PyArray_Check(actions_arr) || !PyArray_Check(valid_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    PyArrayObject *actions_array = (PyArrayObject *)actions_arr;
+    PyArrayObject *valid_array = (PyArrayObject *)valid_arr;
+    if (!PyArray_ISCONTIGUOUS(actions_array) || !PyArray_ISCONTIGUOUS(valid_array)) {
+        PyErr_SetString(PyExc_ValueError, "All output arrays must be contiguous");
+        return NULL;
+    }
+    if (PyArray_ITEMSIZE(valid_array) != sizeof(unsigned char)) {
+        PyErr_SetString(PyExc_TypeError, "valid output array must use uint8/bool-compatible storage");
+        return NULL;
+    }
+
+    if (drive->action_type == 1) {
+        if (PyArray_ITEMSIZE(actions_array) != sizeof(float) || PyArray_NDIM(actions_array) != 2 ||
+            PyArray_DIM(actions_array, 1) != 2) {
+            PyErr_SetString(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, 2)");
+            return NULL;
+        }
+        float *actions_data = (float *)PyArray_DATA(actions_array);
+        unsigned char *valid_data = (unsigned char *)PyArray_DATA(valid_array);
+        c_get_expert_actions(drive, actions_data, NULL, valid_data);
+    } else {
+        if (PyArray_ITEMSIZE(actions_array) != sizeof(int) || PyArray_NDIM(actions_array) != 1) {
+            PyErr_SetString(PyExc_TypeError, "discrete expert actions array must have shape (num_agents,)");
+            return NULL;
+        }
+        int *actions_data = (int *)PyArray_DATA(actions_array);
+        unsigned char *valid_data = (unsigned char *)PyArray_DATA(valid_array);
+        c_get_expert_actions(drive, NULL, actions_data, valid_data);
+    }
+
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_expert_actions(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 3) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_expert_actions requires 3 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) {
+        return NULL;
+    }
+
+    PyObject *actions_arr = PyTuple_GetItem(args, 1);
+    PyObject *valid_arr = PyTuple_GetItem(args, 2);
+    if (!PyArray_Check(actions_arr) || !PyArray_Check(valid_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    PyArrayObject *actions_array = (PyArrayObject *)actions_arr;
+    PyArrayObject *valid_array = (PyArrayObject *)valid_arr;
+    if (!PyArray_ISCONTIGUOUS(actions_array) || !PyArray_ISCONTIGUOUS(valid_array)) {
+        PyErr_SetString(PyExc_ValueError, "All output arrays must be contiguous");
+        return NULL;
+    }
+    if (PyArray_ITEMSIZE(valid_array) != sizeof(unsigned char) || PyArray_NDIM(valid_array) != 1) {
+        PyErr_SetString(PyExc_TypeError, "valid output array must have shape (num_agents,) and uint8 storage");
+        return NULL;
+    }
+
+    Drive *first_drive = (Drive *)vec->envs[0];
+    int offset = 0;
+    unsigned char *valid_base = (unsigned char *)PyArray_DATA(valid_array);
+
+    if (first_drive->action_type == 1) {
+        if (PyArray_ITEMSIZE(actions_array) != sizeof(float) || PyArray_NDIM(actions_array) != 2 ||
+            PyArray_DIM(actions_array, 1) != 2) {
+            PyErr_SetString(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, 2)");
+            return NULL;
+        }
+        float *actions_base = (float *)PyArray_DATA(actions_array);
+        for (int i = 0; i < vec->num_envs; i++) {
+            Drive *drive = (Drive *)vec->envs[i];
+            c_get_expert_actions(drive, &actions_base[offset * 2], NULL, &valid_base[offset]);
+            offset += drive->active_agent_count;
+        }
+    } else {
+        if (PyArray_ITEMSIZE(actions_array) != sizeof(int) || PyArray_NDIM(actions_array) != 1) {
+            PyErr_SetString(PyExc_TypeError, "discrete expert actions array must have shape (num_agents,)");
+            return NULL;
+        }
+        int *actions_base = (int *)PyArray_DATA(actions_array);
+        for (int i = 0; i < vec->num_envs; i++) {
+            Drive *drive = (Drive *)vec->envs[i];
+            c_get_expert_actions(drive, NULL, &actions_base[offset], &valid_base[offset]);
+            offset += drive->active_agent_count;
+        }
+    }
+
+    Py_RETURN_NONE;
+}
+
 static PyObject *get_global_agent_state(PyObject *self, PyObject *args) {
     if (PyTuple_Size(args) != 7) {
         PyErr_SetString(PyExc_TypeError, "get_global_agent_state requires 7 arguments");
@@ -1055,6 +1169,9 @@ static PyMethodDef methods[] = {
     {"vec_render", vec_render, METH_VARARGS, "Render the vector of environments"},
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
     {"vec_get_scenario_ids", vec_get_scenario_ids, METH_VARARGS, "Get scenario IDs for all envs"},
+    {"get_expert_actions", get_expert_actions, METH_VARARGS, "Get current expert actions for active agents"},
+    {"vec_get_expert_actions", vec_get_expert_actions, METH_VARARGS,
+     "Get current expert actions from vectorized env"},
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
     {"get_global_agent_state", get_global_agent_state, METH_VARARGS, "Get global agent state"},
     {"vec_get_global_agent_state", vec_get_global_agent_state, METH_VARARGS, "Get agent state from vectorized env"},

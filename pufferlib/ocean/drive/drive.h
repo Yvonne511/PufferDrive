@@ -128,6 +128,8 @@ static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
 
 // Classic action space (for CLASSIC dynamics model)
+#define NUM_ACCEL_BINS 7
+#define NUM_STEER_BINS 13
 static const float ACCELERATION_VALUES[7] = {-4.0000f, -2.6670f, -1.3330f, -0.0000f, 1.3330f, 2.6670f, 4.0000f};
 static const float STEERING_VALUES[13] = {-1.000f, -0.833f, -0.667f, -0.500f, -0.333f, -0.167f, 0.000f,
                                           0.167f,  0.333f,  0.500f,  0.667f,  0.833f,  1.000f};
@@ -206,6 +208,11 @@ struct Entity {
     float *traj_vz;
     float *traj_heading;
     int *traj_valid;
+    float *expert_acceleration;
+    float *expert_steering;
+    float *expert_delta_x;
+    float *expert_delta_y;
+    float *expert_delta_yaw;
     float width;
     float length;
     float height;
@@ -257,6 +264,11 @@ void free_entity(Entity *entity) {
     free(entity->traj_vz);
     free(entity->traj_heading);
     free(entity->traj_valid);
+    free(entity->expert_acceleration);
+    free(entity->expert_steering);
+    free(entity->expert_delta_x);
+    free(entity->expert_delta_y);
+    free(entity->expert_delta_yaw);
 }
 
 // Utility functions
@@ -455,6 +467,11 @@ Entity *load_map_binary(const char *filename, Drive *env) {
             entities[i].traj_vz = (float *)malloc(size * sizeof(float));
             entities[i].traj_heading = (float *)malloc(size * sizeof(float));
             entities[i].traj_valid = (int *)malloc(size * sizeof(int));
+            entities[i].expert_acceleration = (float *)malloc(size * sizeof(float));
+            entities[i].expert_steering = (float *)malloc(size * sizeof(float));
+            entities[i].expert_delta_x = (float *)malloc(size * sizeof(float));
+            entities[i].expert_delta_y = (float *)malloc(size * sizeof(float));
+            entities[i].expert_delta_yaw = (float *)malloc(size * sizeof(float));
         } else {
             // Roads don't use these arrays
             entities[i].traj_vx = NULL;
@@ -462,6 +479,11 @@ Entity *load_map_binary(const char *filename, Drive *env) {
             entities[i].traj_vz = NULL;
             entities[i].traj_heading = NULL;
             entities[i].traj_valid = NULL;
+            entities[i].expert_acceleration = NULL;
+            entities[i].expert_steering = NULL;
+            entities[i].expert_delta_x = NULL;
+            entities[i].expert_delta_y = NULL;
+            entities[i].expert_delta_yaw = NULL;
         }
         // Read array data
         fread(entities[i].traj_x, sizeof(float), size, file);
@@ -474,6 +496,11 @@ Entity *load_map_binary(const char *filename, Drive *env) {
             fread(entities[i].traj_vz, sizeof(float), size, file);
             fread(entities[i].traj_heading, sizeof(float), size, file);
             fread(entities[i].traj_valid, sizeof(int), size, file);
+            fread(entities[i].expert_acceleration, sizeof(float), size, file);
+            fread(entities[i].expert_steering, sizeof(float), size, file);
+            fread(entities[i].expert_delta_x, sizeof(float), size, file);
+            fread(entities[i].expert_delta_y, sizeof(float), size, file);
+            fread(entities[i].expert_delta_yaw, sizeof(float), size, file);
         }
         // Read remaining scalar fields
         fread(&entities[i].width, sizeof(float), 1, file);
@@ -1545,6 +1572,140 @@ float normalize_heading(float heading) {
 
 float normalize_value(float value, float min, float max) { return (value - min) / (max - min); }
 
+bool has_valid_expert_action_timestep(const Entity *agent, int t) {
+    if (agent == NULL)
+        return false;
+    if (agent->expert_acceleration == NULL || agent->expert_steering == NULL || agent->expert_delta_x == NULL ||
+        agent->expert_delta_y == NULL || agent->expert_delta_yaw == NULL) {
+        return false;
+    }
+    if (agent->traj_valid == NULL)
+        return false;
+    if (t < 0 || (t + 1) >= agent->array_size)
+        return false;
+    return agent->traj_valid[t] && agent->traj_valid[t + 1];
+}
+
+float get_entity_speed_at_timestep(const Entity *agent, int t) {
+    if (agent == NULL || agent->traj_vx == NULL || agent->traj_vy == NULL)
+        return 0.0f;
+    if (t < 0 || t >= agent->array_size)
+        return 0.0f;
+    float vx = agent->traj_vx[t];
+    float vy = agent->traj_vy[t];
+    return sqrtf(vx * vx + vy * vy);
+}
+
+int nearest_bin_index(const float *bins, int num_bins, float value) {
+    int best_idx = 0;
+    float best_dist = fabsf(value - bins[0]);
+    for (int i = 1; i < num_bins; i++) {
+        float dist = fabsf(value - bins[i]);
+        if (dist < best_dist) {
+            best_idx = i;
+            best_dist = dist;
+        }
+    }
+    return best_idx;
+}
+
+bool get_expert_deltas(const Entity *agent, int t, float *dx, float *dy, float *dyaw) {
+    if (!has_valid_expert_action_timestep(agent, t))
+        return false;
+
+    if (dx != NULL)
+        *dx = agent->expert_delta_x[t];
+    if (dy != NULL)
+        *dy = agent->expert_delta_y[t];
+    if (dyaw != NULL)
+        *dyaw = agent->expert_delta_yaw[t];
+
+    return true;
+}
+
+bool get_expert_action_semantics(Drive *env, const Entity *agent, int t, float *action_0, float *action_1) {
+    if (env == NULL || action_0 == NULL || action_1 == NULL)
+        return false;
+    if (!has_valid_expert_action_timestep(agent, t))
+        return false;
+
+    if (env->dynamics_model == CLASSIC) {
+        *action_0 = agent->expert_acceleration[t];
+        *action_1 = agent->expert_steering[t];
+        return true;
+    }
+
+    // For JERK dynamics we derive expert jerk from successive expert accelerations.
+    float expert_a_long = agent->expert_acceleration[t];
+    float speed_t = get_entity_speed_at_timestep(agent, t);
+    float expert_a_lat = speed_t * (agent->expert_delta_yaw[t] / env->dt);
+
+    float prev_a_long = expert_a_long;
+    float prev_a_lat = expert_a_lat;
+    if (t > 0 && has_valid_expert_action_timestep(agent, t - 1)) {
+        prev_a_long = agent->expert_acceleration[t - 1];
+        float prev_speed = get_entity_speed_at_timestep(agent, t - 1);
+        prev_a_lat = prev_speed * (agent->expert_delta_yaw[t - 1] / env->dt);
+    }
+
+    *action_0 = (expert_a_long - prev_a_long) / env->dt;
+    *action_1 = (expert_a_lat - prev_a_lat) / env->dt;
+    return true;
+}
+
+bool get_expert_action_continuous(Drive *env, const Entity *agent, int t, float *action_0, float *action_1) {
+    float semantic_0 = 0.0f;
+    float semantic_1 = 0.0f;
+    if (action_0 == NULL || action_1 == NULL)
+        return false;
+    if (!get_expert_action_semantics(env, agent, t, &semantic_0, &semantic_1))
+        return false;
+
+    if (env->dynamics_model == CLASSIC) {
+        *action_0 = clip(semantic_0 / ACCELERATION_VALUES[NUM_ACCEL_BINS - 1], -1.0f, 1.0f);
+        *action_1 = clip(semantic_1 / STEERING_VALUES[NUM_STEER_BINS - 1], -1.0f, 1.0f);
+        return true;
+    }
+
+    if (semantic_0 < 0.0f) {
+        *action_0 = clip(semantic_0 / (-JERK_LONG[0]), -1.0f, 0.0f);
+    } else {
+        *action_0 = clip(semantic_0 / JERK_LONG[3], 0.0f, 1.0f);
+    }
+    *action_1 = clip(semantic_1 / JERK_LAT[2], -1.0f, 1.0f);
+    return true;
+}
+
+bool get_expert_action_discrete(Drive *env, const Entity *agent, int t, int *action) {
+    float semantic_0 = 0.0f;
+    float semantic_1 = 0.0f;
+    if (action == NULL)
+        return false;
+    if (!get_expert_action_semantics(env, agent, t, &semantic_0, &semantic_1))
+        return false;
+
+    if (env->dynamics_model == CLASSIC) {
+        int acceleration_index = nearest_bin_index(ACCELERATION_VALUES, NUM_ACCEL_BINS, semantic_0);
+        int steering_index = nearest_bin_index(STEERING_VALUES, NUM_STEER_BINS, semantic_1);
+        *action = acceleration_index * NUM_STEER_BINS + steering_index;
+        return true;
+    }
+
+    int num_lat = sizeof(JERK_LAT) / sizeof(JERK_LAT[0]);
+    int jerk_long_index = nearest_bin_index(JERK_LONG, sizeof(JERK_LONG) / sizeof(JERK_LONG[0]), semantic_0);
+    int jerk_lat_index = nearest_bin_index(JERK_LAT, num_lat, semantic_1);
+    *action = jerk_long_index * num_lat + jerk_lat_index;
+    return true;
+}
+
+bool get_expert_action(Drive *env, const Entity *agent, int t, float *action_0, float *action_1, int *action) {
+    if (env == NULL)
+        return false;
+    if (env->action_type == 1)
+        return get_expert_action_continuous(env, agent, t, action_0, action_1);
+    return get_expert_action_discrete(env, agent, t, action);
+}
+
 void move_dynamics(Drive *env, int action_idx, int agent_idx) {
     Entity *agent = &env->entities[agent_idx];
     if (agent->removed)
@@ -1746,6 +1907,29 @@ void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_o
         id_out[i] = agent->id;
         length_out[i] = agent->length;
         width_out[i] = agent->width;
+    }
+}
+
+void c_get_expert_actions(Drive *env, float *continuous_actions_out, int *discrete_actions_out, unsigned char *valid_out) {
+    int t = env->timestep;
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        Entity *agent = &env->entities[agent_idx];
+        valid_out[i] = 0;
+
+        if (env->action_type == 1) {
+            continuous_actions_out[2 * i] = 0.0f;
+            continuous_actions_out[2 * i + 1] = 0.0f;
+            if (get_expert_action(env, agent, t, &continuous_actions_out[2 * i], &continuous_actions_out[2 * i + 1],
+                                  NULL)) {
+                valid_out[i] = 1;
+            }
+        } else {
+            discrete_actions_out[i] = NOOP;
+            if (get_expert_action(env, agent, t, NULL, NULL, &discrete_actions_out[i])) {
+                valid_out[i] = 1;
+            }
+        }
     }
 }
 

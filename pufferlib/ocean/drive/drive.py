@@ -3,6 +3,7 @@ import gymnasium
 import json
 import struct
 import os
+import math
 import pufferlib
 from enum import IntEnum
 from pufferlib.ocean.drive import binding
@@ -332,6 +333,24 @@ class Drive(pufferlib.PufferEnv):
 
         return states
 
+    def get_expert_actions(self):
+        """Get current expert actions for all active agents.
+
+        Returns:
+            tuple: (actions, valid)
+            - `actions` matches the environment action space shape for active agents
+            - `valid` is a boolean mask indicating which expert actions are available
+        """
+        valid = np.zeros(self.num_agents, dtype=np.uint8)
+
+        if self._action_type_flag == 1:
+            actions = np.zeros((self.num_agents, 2), dtype=np.float32)
+        else:
+            actions = np.zeros(self.num_agents, dtype=np.int32)
+
+        binding.vec_get_expert_actions(self.c_envs, actions, valid)
+        return actions, valid.astype(bool)
+
     def get_ground_truth_trajectories(self):
         """Get ground truth trajectories for all active agents.
 
@@ -470,6 +489,135 @@ def simplify_polyline(geometry, polyline_reduction_threshold, max_segment_length
 
     return [geometry[i] for i in range(num_points) if not skip[i]]
 
+def infer_human_actions(obj):
+    """Infer expert actions using inverse bicycle model and delta-local displacements.
+
+    Returns:
+        (expert_acceleration, expert_steering,
+         expert_delta_x, expert_delta_y, expert_delta_yaw)
+        Each is a list of length trajectory_length (91).
+        -1.0 is the placeholder for invalid timesteps (accel/steering).
+        0.0 is used for invalid delta timesteps.
+    """
+    trajectory_length = 91
+
+    expert_acceleration = []
+    expert_steering = []
+    expert_delta_x = []
+    expert_delta_y = []
+    expert_delta_yaw = []
+
+    positions = obj.get("position", [])
+    velocities = obj.get("velocity", [])
+    headings = obj.get("heading", [])
+    valids = obj.get("valid", [])
+
+    if len(positions) < 2 or len(velocities) < 2 or len(headings) < 2:
+        return (
+            [-1.0] * trajectory_length,
+            [-1.0] * trajectory_length,
+            [0.0] * trajectory_length,
+            [0.0] * trajectory_length,
+            [0.0] * trajectory_length,
+        )
+
+    dt = 0.1
+    vehicle_length = obj.get("length", 4.5)
+    wheelbase = 1.0 * vehicle_length
+
+    for t in range(trajectory_length):
+        # Check validity for both current and next timestep
+        valid_pair = (
+            t < len(positions)
+            and t < len(velocities)
+            and t < len(headings)
+            and t < len(valids)
+            and valids[t]
+            and t + 1 < len(positions)
+            and t + 1 < len(velocities)
+            and t + 1 < len(headings)
+            and t + 1 < len(valids)
+            and valids[t + 1]
+        )
+
+        if not valid_pair:
+            expert_acceleration.append(-1.0)
+            expert_steering.append(-1.0)
+            expert_delta_x.append(0.0)
+            expert_delta_y.append(0.0)
+            expert_delta_yaw.append(0.0)
+            continue
+
+        # Current and next state
+        pos_t = positions[t]
+        pos_t1 = positions[t + 1]
+        vel_t = velocities[t]
+        vel_t1 = velocities[t + 1]
+        heading_t = headings[t]
+        heading_t1 = headings[t + 1]
+
+        speed_t = math.sqrt(vel_t.get("x", 0.0) ** 2 + vel_t.get("y", 0.0) ** 2)
+        speed_t1 = math.sqrt(vel_t1.get("x", 0.0) ** 2 + vel_t1.get("y", 0.0) ** 2)
+
+        # Classic inverse bicycle model (accel + steering)
+        acceleration = (speed_t1 - speed_t) / dt
+
+        heading_diff = heading_t1 - heading_t
+        while heading_diff > math.pi:
+            heading_diff -= 2 * math.pi
+        while heading_diff < -math.pi:
+            heading_diff += 2 * math.pi
+
+        yaw_rate = heading_diff / dt
+
+        steering = 0.0
+        if speed_t > 0.1:
+            tan_steering = (yaw_rate * wheelbase) / speed_t
+            tan_steering = max(-10.0, min(10.0, tan_steering))
+            steering = math.atan(tan_steering)
+
+        acceleration = max(-20.0, min(20.0, acceleration))
+        steering = max(-4.0, min(4.0, steering))
+
+        expert_acceleration.append(acceleration)
+        expert_steering.append(steering)
+
+        # Delta-local: (dx, dy, dyaw) in agent's local frame
+        global_dx = pos_t1.get("x", 0.0) - pos_t.get("x", 0.0)
+        global_dy = pos_t1.get("y", 0.0) - pos_t.get("y", 0.0)
+
+        # Rotate global displacement into agent's local frame at time t
+        cos_h = math.cos(heading_t)
+        sin_h = math.sin(heading_t)
+        local_dx = cos_h * global_dx + sin_h * global_dy
+        local_dy = -sin_h * global_dx + cos_h * global_dy
+
+        # Clip to bounds
+        local_dx = max(-6.0, min(6.0, local_dx))
+        local_dy = max(-6.0, min(6.0, local_dy))
+
+        expert_delta_x.append(local_dx)
+        expert_delta_y.append(local_dy)
+        expert_delta_yaw.append(heading_diff)  # already wrapped above
+
+    # Pad/truncate to exact trajectory_length
+    for arr, pad_val in [
+        (expert_acceleration, -1.0),
+        (expert_steering, -1.0),
+        (expert_delta_x, 0.0),
+        (expert_delta_y, 0.0),
+        (expert_delta_yaw, 0.0),
+    ]:
+        while len(arr) < trajectory_length:
+            arr.append(pad_val)
+
+    expert_acceleration = expert_acceleration[:trajectory_length]
+    expert_steering = expert_steering[:trajectory_length]
+    expert_delta_x = expert_delta_x[:trajectory_length]
+    expert_delta_y = expert_delta_y[:trajectory_length]
+    expert_delta_yaw = expert_delta_yaw[:trajectory_length]
+
+    return expert_acceleration, expert_steering, expert_delta_x, expert_delta_y, expert_delta_yaw
 
 def save_map_binary(map_data, output_file, unique_map_id):
     trajectory_length = 91
@@ -551,6 +699,19 @@ def save_map_binary(map_data, output_file, unique_map_id):
                     *[int(valids[i]) if i < len(valids) else 0 for i in range(trajectory_length)],
                 )
             )
+
+            # Infer and write human actions
+            if obj_type in [1, 2, 3]:
+                human_accel, human_steering, human_dx, human_dy, human_dyaw = infer_human_actions(obj)
+                f.write(struct.pack(f"{trajectory_length}f", *human_accel))
+                f.write(struct.pack(f"{trajectory_length}f", *human_steering))
+                f.write(struct.pack(f"{trajectory_length}f", *human_dx))
+                f.write(struct.pack(f"{trajectory_length}f", *human_dy))
+                f.write(struct.pack(f"{trajectory_length}f", *human_dyaw))
+            else:
+                # accel, steering, delta_x, delta_y, delta_yaw
+                for _ in range(5):
+                    f.write(struct.pack(f"{trajectory_length}f", *[0.0] * trajectory_length))
 
             # Write scalar fields
             f.write(struct.pack("f", float(obj.get("width", 0.0))))
