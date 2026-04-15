@@ -16,6 +16,7 @@ class RenderView(IntEnum):
     BEV_AGENT_OBS = 1  # Orthographic top-down, only show what the selected agent can observe
     AGENT_PERSP = 2  # Third-person perspective following selected agent
 
+DYNAMICS_MODEL_MAP = {"classic": 0, "jerk": 1, "delta": 2}
 
 class Drive(pufferlib.PufferEnv):
     def __init__(
@@ -72,9 +73,10 @@ class Drive(pufferlib.PufferEnv):
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
         self.max_controlled_agents = max_controlled_agents
+        self._dynamics_model_flag = DYNAMICS_MODEL_MAP[dynamics_model]
 
         # Observation space calculation
-        self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
+        self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK, "delta": binding.EGO_FEATURES_CLASSIC}.get(
             dynamics_model
         )
 
@@ -120,7 +122,14 @@ class Drive(pufferlib.PufferEnv):
                 f"init_mode must be one of 'create_all_valid' or 'create_only_controlled'. Got: {self.init_mode_str}"
             )
 
-        if action_type == "discrete":
+        if dynamics_model == "delta": # assume continuous
+            self.single_action_space = gymnasium.spaces.Box(
+                low=np.array([-binding.DELTA_MAX_DX, -binding.DELTA_MAX_DY, -binding.DELTA_MAX_DYAW], dtype=np.float32),
+                high=np.array([binding.DELTA_MAX_DX, binding.DELTA_MAX_DY, binding.DELTA_MAX_DYAW], dtype=np.float32),
+                dtype=np.float32,
+            )
+            self._action_type_flag = 1
+        elif action_type == "discrete":
             if dynamics_model == "classic":
                 # Joint action space (assume dependence)
                 self.single_action_space = gymnasium.spaces.MultiDiscrete([7 * 13])
@@ -130,13 +139,15 @@ class Drive(pufferlib.PufferEnv):
                 # Joint action space (assume dependence) - 4 longitudinal × 3 lateral = 12
                 self.single_action_space = gymnasium.spaces.MultiDiscrete([4 * 3])
             else:
-                raise ValueError(f"dynamics_model must be 'classic' or 'jerk'. Got: {dynamics_model}")
+                raise ValueError(f"discrete actions only support 'classic' or 'jerk'. Got: {dynamics_model}")
+            self._action_type_flag = 0
         elif action_type == "continuous":
             self.single_action_space = gymnasium.spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+            self._action_type_flag = 1
         else:
             raise ValueError(f"action_space must be 'discrete' or 'continuous'. Got: {action_type}")
 
-        self._action_type_flag = 0 if action_type == "discrete" else 1
+        # self._action_type_flag = 0 if action_type == "discrete" else 1
 
         # Check if resources directory exists
         binary_path = f"{map_dir}/map_000.bin"
@@ -205,6 +216,7 @@ class Drive(pufferlib.PufferEnv):
                 map_dir=map_dir,
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=render_mode,
+                dynamics_model=self._dynamics_model_flag,
             )
             self.env_ids.append(env_id)
 
@@ -271,6 +283,7 @@ class Drive(pufferlib.PufferEnv):
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=self.render_mode,
+                dynamics_model=self._dynamics_model_flag,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
@@ -344,7 +357,8 @@ class Drive(pufferlib.PufferEnv):
         valid = np.zeros(self.num_agents, dtype=np.uint8)
 
         if self._action_type_flag == 1:
-            actions = np.zeros((self.num_agents, 2), dtype=np.float32)
+            continuous_dim = 3 if self._dynamics_model_flag == 2 else 2
+            actions = np.zeros((self.num_agents, continuous_dim), dtype=np.float32)
         else:
             actions = np.zeros(self.num_agents, dtype=np.int32)
 

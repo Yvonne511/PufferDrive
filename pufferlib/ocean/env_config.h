@@ -52,6 +52,8 @@ static int handler(void *config, const char *section, const char *name, const ch
             env_config->dynamics_model = 0; // CLASSIC
         } else if (strcmp(value, "\"jerk\"") == 0 || strcmp(value, "jerk") == 0) {
             env_config->dynamics_model = 1; // JERK
+        } else if (strcmp(value, "\"delta\"") == 0 || strcmp(value, "delta") == 0) {
+            env_config->dynamics_model = 2; // DELTA
         } else {
             printf("Warning: Unknown dynamics_model value '%s', defaulting to JERK\n", value);
             env_config->dynamics_model = 1; // Default to JERK

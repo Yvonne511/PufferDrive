@@ -739,9 +739,11 @@ static PyObject *get_expert_actions(PyObject *self, PyObject *args) {
     }
 
     if (drive->action_type == 1) {
+        int continuous_dim = continuous_action_dim(drive);
         if (PyArray_ITEMSIZE(actions_array) != sizeof(float) || PyArray_NDIM(actions_array) != 2 ||
-            PyArray_DIM(actions_array, 1) != 2) {
-            PyErr_SetString(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, 2)");
+            PyArray_DIM(actions_array, 1) != continuous_dim) {
+            PyErr_Format(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, %d)",
+                         continuous_dim);
             return NULL;
         }
         float *actions_data = (float *)PyArray_DATA(actions_array);
@@ -794,15 +796,17 @@ static PyObject *vec_get_expert_actions(PyObject *self, PyObject *args) {
     unsigned char *valid_base = (unsigned char *)PyArray_DATA(valid_array);
 
     if (first_drive->action_type == 1) {
+        int continuous_dim = continuous_action_dim(first_drive);
         if (PyArray_ITEMSIZE(actions_array) != sizeof(float) || PyArray_NDIM(actions_array) != 2 ||
-            PyArray_DIM(actions_array, 1) != 2) {
-            PyErr_SetString(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, 2)");
+            PyArray_DIM(actions_array, 1) != continuous_dim) {
+            PyErr_Format(PyExc_TypeError, "continuous expert actions array must have shape (num_agents, %d)",
+                         continuous_dim);
             return NULL;
         }
         float *actions_base = (float *)PyArray_DATA(actions_array);
         for (int i = 0; i < vec->num_envs; i++) {
             Drive *drive = (Drive *)vec->envs[i];
-            c_get_expert_actions(drive, &actions_base[offset * 2], NULL, &valid_base[offset]);
+            c_get_expert_actions(drive, &actions_base[offset * continuous_dim], NULL, &valid_base[offset]);
             offset += drive->active_agent_count;
         }
     } else {
@@ -1206,6 +1210,15 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
     PyModule_AddIntConstant(m, "EGO_FEATURES_CLASSIC", EGO_FEATURES_CLASSIC);
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
+#ifdef DELTA_MAX_DX
+    PyModule_AddObject(m, "DELTA_MAX_DX", PyFloat_FromDouble((double)DELTA_MAX_DX));
+#endif
+#ifdef DELTA_MAX_DY
+    PyModule_AddObject(m, "DELTA_MAX_DY", PyFloat_FromDouble((double)DELTA_MAX_DY));
+#endif
+#ifdef DELTA_MAX_DYAW
+    PyModule_AddObject(m, "DELTA_MAX_DYAW", PyFloat_FromDouble((double)DELTA_MAX_DYAW));
+#endif
 
     return m;
 }

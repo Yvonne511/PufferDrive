@@ -67,6 +67,7 @@
 // Dynamics Models
 #define CLASSIC 0
 #define JERK 1
+#define DELTA 2
 
 // Collision state
 #define NO_COLLISION 0
@@ -126,6 +127,14 @@
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
+
+// Delta action bounds (for DELTA dynamics model)
+#define DELTA_MAX_DX 6.0f
+#define DELTA_MAX_DY 6.0f
+#define DELTA_MAX_DYAW PI
+// #define DELTA_MAX_DX 2.5f
+// #define DELTA_MAX_DY 2.0f
+// #define DELTA_MAX_DYAW 3.14159265 / 4.0
 
 // Classic action space (for CLASSIC dynamics model)
 #define NUM_ACCEL_BINS 7
@@ -254,6 +263,14 @@ struct Entity {
     float wheelbase;
 };
 
+static inline int ego_feature_dim_from_model(int dynamics_model) {
+    return (dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+}
+
+static inline int continuous_action_dim_from_model(int dynamics_model) {
+    return (dynamics_model == DELTA) ? 3 : 2;
+}
+
 void free_entity(Entity *entity) {
     // free trajectory arrays
     free(entity->traj_x);
@@ -371,6 +388,10 @@ struct Drive {
     int max_controlled_agents;
     int render_mode;
 };
+
+static inline int continuous_action_dim(const Drive *env) {
+    return continuous_action_dim_from_model(env->dynamics_model);
+}
 
 void add_log(Drive *env) {
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -1535,10 +1556,10 @@ void c_close(Drive *env) {
 
 void allocate(Drive *env) {
     init(env);
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_dim_from_model(env->dynamics_model);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     env->observations = (float *)calloc(env->active_agent_count * max_obs, sizeof(float));
-    env->actions = (float *)calloc(env->active_agent_count * 2, sizeof(float));
+    env->actions = (float *)calloc(env->active_agent_count * continuous_action_dim(env), sizeof(float));
     env->rewards = (float *)calloc(env->active_agent_count, sizeof(float));
     env->terminals = (unsigned char *)calloc(env->active_agent_count, sizeof(unsigned char));
     env->truncations = (unsigned char *)calloc(env->active_agent_count, sizeof(unsigned char));
@@ -1635,6 +1656,9 @@ bool get_expert_action_semantics(Drive *env, const Entity *agent, int t, float *
         return true;
     }
 
+    if (env->dynamics_model != JERK)
+        return false;
+
     // For JERK dynamics we derive expert jerk from successive expert accelerations.
     float expert_a_long = agent->expert_acceleration[t];
     float speed_t = get_entity_speed_at_timestep(agent, t);
@@ -1653,26 +1677,31 @@ bool get_expert_action_semantics(Drive *env, const Entity *agent, int t, float *
     return true;
 }
 
-bool get_expert_action_continuous(Drive *env, const Entity *agent, int t, float *action_0, float *action_1) {
+bool get_expert_action_continuous(Drive *env, const Entity *agent, int t, float *actions_out) {
+    if (env == NULL || actions_out == NULL)
+        return false;
+
+    if (env->dynamics_model == DELTA) {
+        return get_expert_deltas(agent, t, &actions_out[0], &actions_out[1], &actions_out[2]);
+    }
+
     float semantic_0 = 0.0f;
     float semantic_1 = 0.0f;
-    if (action_0 == NULL || action_1 == NULL)
-        return false;
     if (!get_expert_action_semantics(env, agent, t, &semantic_0, &semantic_1))
         return false;
 
     if (env->dynamics_model == CLASSIC) {
-        *action_0 = clip(semantic_0 / ACCELERATION_VALUES[NUM_ACCEL_BINS - 1], -1.0f, 1.0f);
-        *action_1 = clip(semantic_1 / STEERING_VALUES[NUM_STEER_BINS - 1], -1.0f, 1.0f);
+        actions_out[0] = clip(semantic_0 / ACCELERATION_VALUES[NUM_ACCEL_BINS - 1], -1.0f, 1.0f);
+        actions_out[1] = clip(semantic_1 / STEERING_VALUES[NUM_STEER_BINS - 1], -1.0f, 1.0f);
         return true;
     }
 
     if (semantic_0 < 0.0f) {
-        *action_0 = clip(semantic_0 / (-JERK_LONG[0]), -1.0f, 0.0f);
+        actions_out[0] = clip(semantic_0 / (-JERK_LONG[0]), -1.0f, 0.0f);
     } else {
-        *action_0 = clip(semantic_0 / JERK_LONG[3], 0.0f, 1.0f);
+        actions_out[0] = clip(semantic_0 / JERK_LONG[3], 0.0f, 1.0f);
     }
-    *action_1 = clip(semantic_1 / JERK_LAT[2], -1.0f, 1.0f);
+    actions_out[1] = clip(semantic_1 / JERK_LAT[2], -1.0f, 1.0f);
     return true;
 }
 
@@ -1680,6 +1709,8 @@ bool get_expert_action_discrete(Drive *env, const Entity *agent, int t, int *act
     float semantic_0 = 0.0f;
     float semantic_1 = 0.0f;
     if (action == NULL)
+        return false;
+    if (env->dynamics_model == DELTA)
         return false;
     if (!get_expert_action_semantics(env, agent, t, &semantic_0, &semantic_1))
         return false;
@@ -1698,11 +1729,11 @@ bool get_expert_action_discrete(Drive *env, const Entity *agent, int t, int *act
     return true;
 }
 
-bool get_expert_action(Drive *env, const Entity *agent, int t, float *action_0, float *action_1, int *action) {
+bool get_expert_action(Drive *env, const Entity *agent, int t, float *continuous_action, int *action) {
     if (env == NULL)
         return false;
     if (env->action_type == 1)
-        return get_expert_action_continuous(env, agent, t, action_0, action_1);
+        return get_expert_action_continuous(env, agent, t, continuous_action);
     return get_expert_action_discrete(env, agent, t, action);
 }
 
@@ -1778,6 +1809,34 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         agent->heading_y = sinf(heading);
         agent->vx = new_vx;
         agent->vy = new_vy;
+    } else if (env->dynamics_model == DELTA) {
+        float dx_local = 0.0f;
+        float dy_local = 0.0f;
+        float dyaw = 0.0f;
+
+        if (env->action_type == 1) { // continuous
+            float (*action_array_f)[3] = (float (*)[3])env->actions;
+            dx_local = clip(action_array_f[action_idx][0], -DELTA_MAX_DX, DELTA_MAX_DX);
+            dy_local = clip(action_array_f[action_idx][1], -DELTA_MAX_DY, DELTA_MAX_DY);
+            dyaw = clip(action_array_f[action_idx][2], -DELTA_MAX_DYAW, DELTA_MAX_DYAW);
+        }
+
+        // Delta actions are provided in the agent's local frame.
+        float dx = dx_local * agent->heading_x - dy_local * agent->heading_y;
+        float dy = dx_local * agent->heading_y + dy_local * agent->heading_x;
+
+        agent->x += dx;
+        agent->y += dy;
+        agent->heading = normalize_heading(agent->heading + dyaw);
+        agent->heading_x = cosf(agent->heading);
+        agent->heading_y = sinf(agent->heading);
+        agent->vx = dx / env->dt;
+        agent->vy = dy / env->dt;
+        agent->a_long = 0.0f;
+        agent->a_lat = 0.0f;
+        agent->jerk_long = 0.0f;
+        agent->jerk_lat = 0.0f;
+        agent->steering_angle = 0.0f;
     } else {
         // JERK dynamics model
         // Extract action components
@@ -1912,21 +1971,22 @@ void c_get_global_agent_state(Drive *env, float *x_out, float *y_out, float *z_o
 
 void c_get_expert_actions(Drive *env, float *continuous_actions_out, int *discrete_actions_out, unsigned char *valid_out) {
     int t = env->timestep;
+    int continuous_dim = continuous_action_dim(env);
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
         Entity *agent = &env->entities[agent_idx];
         valid_out[i] = 0;
 
         if (env->action_type == 1) {
-            continuous_actions_out[2 * i] = 0.0f;
-            continuous_actions_out[2 * i + 1] = 0.0f;
-            if (get_expert_action(env, agent, t, &continuous_actions_out[2 * i], &continuous_actions_out[2 * i + 1],
-                                  NULL)) {
+            for (int j = 0; j < continuous_dim; j++) {
+                continuous_actions_out[continuous_dim * i + j] = 0.0f;
+            }
+            if (get_expert_action(env, agent, t, &continuous_actions_out[continuous_dim * i], NULL)) {
                 valid_out[i] = 1;
             }
         } else {
             discrete_actions_out[i] = NOOP;
-            if (get_expert_action(env, agent, t, NULL, NULL, &discrete_actions_out[i])) {
+            if (get_expert_action(env, agent, t, NULL, &discrete_actions_out[i])) {
                 valid_out[i] = 1;
             }
         }
@@ -1991,7 +2051,7 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
 }
 
 void compute_observations(Drive *env) {
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_dim_from_model(env->dynamics_model);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
@@ -2647,7 +2707,7 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         return;
     }
 
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+    int ego_dim = ego_feature_dim_from_model(env->dynamics_model);
     int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     float *agent_obs = &observations[agent_index][0];
@@ -3323,13 +3383,24 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
                 DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
             }
         } else { // continuous
-            float (*action_array_f)[2] = (float (*)[2])env->actions;
-            DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
-                     action_color);
-            DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20, action_color);
+            if (env->dynamics_model == DELTA) {
+                float (*action_array_f)[3] = (float (*)[3])env->actions;
+                DrawText(TextFormat("dX: %.2f m", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
+                         action_color);
+                DrawText(TextFormat("dY: %.2f m", action_array_f[env->human_agent_idx][1]), 10, 130, 20,
+                         action_color);
+                DrawText(TextFormat("dYaw: %.2f rad", action_array_f[env->human_agent_idx][2]), 10, 150, 20,
+                         action_color);
+            } else {
+                float (*action_array_f)[2] = (float (*)[2])env->actions;
+                DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
+                         action_color);
+                DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20,
+                         action_color);
+            }
         }
 
-        int status_y = 150;
+        int status_y = (env->action_type == 1 && env->dynamics_model == DELTA) ? 170 : 150;
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
             status_y += 20;
