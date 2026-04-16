@@ -23,6 +23,15 @@
 #define VIEW_MODE_BEV_AGENT_OBS 1
 #define VIEW_MODE_AGENT_PERSP 2
 
+// Headless agent-perspective render settings.
+// These only apply when the first headless render call uses VIEW_MODE_AGENT_PERSP.
+#define AGENT_PERSP_HEADLESS_USE_FIXED_VIEWPORT 1
+#define AGENT_PERSP_HEADLESS_WIDTH 720
+#define AGENT_PERSP_HEADLESS_HEIGHT 720
+#define AGENT_PERSP_SHOW_GRID 0
+#define AGENT_PERSP_SHOW_OBS_OVERLAY 0
+#define AGENT_PERSP_SHOW_WORLD_GOALS 0
+
 // Order of entities in rendering (lower is rendered first)
 #define Z_ROAD_SURFACE 0.0f
 #define Z_ROAD_MARKINGS 0.05f // Lane lines, road lines, traces
@@ -2488,7 +2497,7 @@ struct Client {
     int xvfb_display_num;
 };
 
-Client *make_client(Drive *env) {
+Client *make_client(Drive *env, int view_mode) {
 
     Client *client = (Client *)calloc(1, sizeof(Client));
 
@@ -2555,14 +2564,19 @@ Client *make_client(Drive *env) {
         SetConfigFlags(FLAG_WINDOW_HIDDEN);
         SetTargetFPS(6000);
 
-        float map_width = env->grid_map->bottom_right_x - env->grid_map->top_left_x;
-        float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
-        float scale = 6.0f; // Controls the resolution of the output video
-        int img_width = (int)roundf(map_width * scale / 2.0f) * 2;
-        int img_height = (int)roundf(map_height * scale / 2.0f) * 2;
+        if (view_mode == VIEW_MODE_AGENT_PERSP && AGENT_PERSP_HEADLESS_USE_FIXED_VIEWPORT) {
+            client->width = AGENT_PERSP_HEADLESS_WIDTH;
+            client->height = AGENT_PERSP_HEADLESS_HEIGHT;
+        } else {
+            float map_width = env->grid_map->bottom_right_x - env->grid_map->top_left_x;
+            float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
+            float scale = 6.0f; // Controls the resolution of the output video
+            int img_width = (int)roundf(map_width * scale / 2.0f) * 2;
+            int img_height = (int)roundf(map_height * scale / 2.0f) * 2;
 
-        client->width = img_width;
-        client->height = img_height;
+            client->width = img_width;
+            client->height = img_height;
+        }
     }
 
     SetTraceLogLevel(LOG_WARNING); // Only show warnings and errors
@@ -2957,7 +2971,8 @@ void draw_road_edge(Drive *env, float start_x, float start_y, float end_x, float
     DrawTriangle3D(t4, t1, b1, CURB_SIDE);
 }
 
-void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, int show_grid) {
+void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, int show_grid, int show_obs_overlay,
+                int show_world_goals) {
 
     if (show_grid) {
         float grid_start_x = env->grid_map->top_left_x;
@@ -3038,7 +3053,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
 
                 };
 
-                if (agent_index == env->human_agent_idx &&
+                if (show_obs_overlay && agent_index == env->human_agent_idx &&
                     !env->entities[agent_index].metrics_array[REACHED_GOAL_IDX]) {
                     draw_agent_obs(env, agent_index, mode, obs_only, lasers);
                 }
@@ -3101,7 +3116,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                     }
                 }
                 // Draw obs for selected agent index
-                if (agent_index == env->human_agent_idx &&
+                if (show_obs_overlay && agent_index == env->human_agent_idx &&
                     (!env->entities[agent_index].metrics_array[REACHED_GOAL_IDX] ||
                      env->goal_behavior == GOAL_GENERATE_NEW || env->goal_behavior == GOAL_STOP)) {
                     draw_agent_obs(env, agent_index, mode, obs_only, lasers);
@@ -3167,7 +3182,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
             if (!is_active_agent || env->entities[i].valid == 0) {
                 continue;
             }
-            if (!IsKeyDown(KEY_LEFT_CONTROL) && obs_only == 0) {
+            if (show_world_goals && !IsKeyDown(KEY_LEFT_CONTROL) && obs_only == 0) {
                 Color goal_color = DEEPBLUE;
                 if (env->entities[i].type == PEDESTRIAN)
                     goal_color = LIGHT_ORANGE;
@@ -3246,7 +3261,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
 
     // Create client on first render call
     if (env->client == NULL) {
-        env->client = make_client(env);
+        env->client = make_client(env, view_mode);
     }
 
     Client *client = env->client;
@@ -3295,7 +3310,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
                 }
             }
 
-            draw_scene(env, client, 1, 0, 0, 0);
+            draw_scene(env, client, 1, 0, 0, 0, 1, 1);
 
         } else if (view_mode == VIEW_MODE_BEV_AGENT_OBS) {
             // Orthographic bird's-eye view centered on the selected agent,
@@ -3313,7 +3328,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             BeginDrawing();
             ClearBackground(ROAD_COLOR);
             BeginMode3D(camera);
-            draw_scene(env, client, 1, 1, 0, 0);
+            draw_scene(env, client, 1, 1, 0, 0, 1, 1);
 
         } else { // First-person perspective from a selected agent
             int agent_idx = env->active_agent_indices[env->human_agent_idx];
@@ -3332,7 +3347,8 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             BeginDrawing();
             ClearBackground(ROAD_COLOR);
             BeginMode3D(camera);
-            draw_scene(env, client, 0, 0, 0, 1);
+            draw_scene(env, client, 0, 0, 0, AGENT_PERSP_SHOW_GRID, AGENT_PERSP_SHOW_OBS_OVERLAY,
+                       AGENT_PERSP_SHOW_WORLD_GOALS);
         }
 
         EndDrawing();
@@ -3347,7 +3363,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
         ClearBackground(ROAD_COLOR);
         BeginMode3D(client->camera);
         handle_camera_controls(env->client);
-        draw_scene(env, client, 0, 0, 0, 0);
+        draw_scene(env, client, 0, 0, 0, 0, 1, 1);
 
         if (IsKeyPressed(KEY_TAB) && env->active_agent_count > 0) {
             env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
