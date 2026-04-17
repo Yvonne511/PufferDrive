@@ -2495,11 +2495,13 @@ struct Client {
     pid_t recorder_pid;
     pid_t xvfb_pid;
     int xvfb_display_num;
+    int record_video;
 };
 
-Client *make_client(Drive *env, int view_mode) {
+Client *make_client(Drive *env, int view_mode, int record_video) {
 
     Client *client = (Client *)calloc(1, sizeof(Client));
+    client->record_video = record_video;
 
     if (env->render_mode == RENDER_HEADLESS && getenv("DISPLAY") == NULL) {
 
@@ -2598,7 +2600,7 @@ Client *make_client(Drive *env, int view_mode) {
     }
 
     // Set up ffmpeg process for recording
-    if (env->render_mode == RENDER_HEADLESS) {
+    if (env->render_mode == RENDER_HEADLESS && client->record_video) {
         if (pipe(client->recorder_pipefd) == -1) {
             fprintf(stderr, "Failed to create pipe\n");
             free(client);
@@ -3257,17 +3259,8 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
     }
 }
 
-void c_render(Drive *env, int view_mode, int draw_traces) {
-
-    // Create client on first render call
-    if (env->client == NULL) {
-        env->client = make_client(env, view_mode);
-    }
-
-    Client *client = env->client;
-
-    if (env->render_mode == RENDER_HEADLESS) { // Headless rendering via ffmpeg
-        float map_width = env->grid_map->bottom_right_x - env->grid_map->top_left_x;
+static void render_frame(Drive *env, Client *client, int view_mode, int draw_traces) {
+    if (env->render_mode == RENDER_HEADLESS) { // Headless rendering via ffmpeg or pixel capture
         float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
 
         Camera3D camera = {0};
@@ -3318,7 +3311,6 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             int agent_idx = env->active_agent_indices[env->human_agent_idx];
             Entity *agent = &env->entities[agent_idx];
 
-            Camera3D camera = {0};
             camera.position = (Vector3){agent->x, agent->y, 400.0f};
             camera.target = (Vector3){agent->x, agent->y, 0.0f};
             camera.up = (Vector3){0.0f, -1.0f, 0.0f};
@@ -3334,8 +3326,6 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             int agent_idx = env->active_agent_indices[env->human_agent_idx];
             Entity *agent = &env->entities[agent_idx];
 
-            Camera3D camera = {0};
-            // Position camera behind and above the agent
             camera.position =
                 (Vector3){agent->x - (25.0f * cosf(agent->heading)), agent->y - (25.0f * sinf(agent->heading)), 15.0f};
             camera.target =
@@ -3352,89 +3342,145 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
         }
 
         EndDrawing();
+        return;
+    }
 
+    BeginDrawing();
+    ClearBackground(ROAD_COLOR);
+    BeginMode3D(client->camera);
+    handle_camera_controls(env->client);
+    draw_scene(env, client, 0, 0, 0, 0, 1, 1);
+
+    if (IsKeyPressed(KEY_TAB) && env->active_agent_count > 0) {
+        env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
+    }
+
+    DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
+    DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
+    int human_idx = env->active_agent_indices[env->human_agent_idx];
+
+    Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
+
+    if (env->action_type == 0) {
+        int *action_array = (int *)env->actions;
+        int action_val = action_array[env->human_agent_idx];
+
+        if (env->dynamics_model == CLASSIC) {
+            int num_steer = 13;
+            int accel_idx = action_val / num_steer;
+            int steer_idx = action_val % num_steer;
+            float accel_value = ACCELERATION_VALUES[accel_idx];
+            float steer_value = STEERING_VALUES[steer_idx];
+
+            DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, 110, 20, action_color);
+            DrawText(TextFormat("Steering: %.3f", steer_value), 10, 130, 20, action_color);
+        } else if (env->dynamics_model == JERK) {
+            int num_lat = 3;
+            int jerk_long_idx = action_val / num_lat;
+            int jerk_lat_idx = action_val % num_lat;
+            float jerk_long_value = JERK_LONG[jerk_long_idx];
+            float jerk_lat_value = JERK_LAT[jerk_lat_idx];
+
+            DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, 110, 20, action_color);
+            DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
+        }
+    } else {
+        if (env->dynamics_model == DELTA) {
+            float (*action_array_f)[3] = (float (*)[3])env->actions;
+            DrawText(TextFormat("dX: %.2f m", action_array_f[env->human_agent_idx][0]), 10, 110, 20, action_color);
+            DrawText(TextFormat("dY: %.2f m", action_array_f[env->human_agent_idx][1]), 10, 130, 20, action_color);
+            DrawText(TextFormat("dYaw: %.2f rad", action_array_f[env->human_agent_idx][2]), 10, 150, 20,
+                     action_color);
+        } else {
+            float (*action_array_f)[2] = (float (*)[2])env->actions;
+            DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
+                     action_color);
+            DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20,
+                     action_color);
+        }
+    }
+
+    int status_y = (env->action_type == 1 && env->dynamics_model == DELTA) ? 170 : 150;
+    if (IsKeyDown(KEY_LEFT_SHIFT)) {
+        DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+    if (IsKeyDown(KEY_SPACE)) {
+        DrawText("[space pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+    if (IsKeyDown(KEY_LEFT_CONTROL)) {
+        DrawText("[ctrl pressed]", 10, status_y, 20, YELLOW);
+        status_y += 20;
+    }
+
+    DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
+             client->height - 30, 20, PUFF_WHITE);
+    DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
+    DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
+    EndDrawing();
+}
+
+unsigned char *c_render_rgb(Drive *env, int view_mode, int draw_traces, int agent_idx, int *width_out, int *height_out) {
+    if (env->client == NULL) {
+        env->client = make_client(env, view_mode, 0);
+    }
+
+    Client *client = env->client;
+    int prev_human_agent_idx = env->human_agent_idx;
+
+    if (agent_idx >= 0) {
+        if (agent_idx >= env->active_agent_count) {
+            return NULL;
+        }
+        env->human_agent_idx = agent_idx;
+    }
+
+    render_frame(env, client, view_mode, draw_traces);
+
+    unsigned char *screen_data = rlReadScreenPixels((int)client->width, (int)client->height);
+    if (screen_data == NULL) {
+        env->human_agent_idx = prev_human_agent_idx;
+        return NULL;
+    }
+
+    int width = (int)client->width;
+    int height = (int)client->height;
+    size_t num_bytes = (size_t)width * height * 4;
+    unsigned char *pixels = (unsigned char *)malloc(num_bytes);
+    if (pixels == NULL) {
+        RL_FREE(screen_data);
+        env->human_agent_idx = prev_human_agent_idx;
+        return NULL;
+    }
+
+    memcpy(pixels, screen_data, num_bytes);
+
+    RL_FREE(screen_data);
+    env->human_agent_idx = prev_human_agent_idx;
+
+    if (width_out != NULL)
+        *width_out = width;
+    if (height_out != NULL)
+        *height_out = height;
+    return pixels;
+}
+
+void c_render(Drive *env, int view_mode, int draw_traces) {
+
+    if (env->client == NULL) {
+        env->client = make_client(env, view_mode, 1);
+    }
+
+    Client *client = env->client;
+    render_frame(env, client, view_mode, draw_traces);
+
+    if (env->render_mode == RENDER_HEADLESS && client->record_video) {
         unsigned char *screen_data = rlReadScreenPixels((int)client->width, (int)client->height);
         if (screen_data) {
             write(client->recorder_pipefd[1], screen_data, (int)client->width * (int)client->height * 4);
             RL_FREE(screen_data);
         }
-    } else { // Pop-up window
-        BeginDrawing();
-        ClearBackground(ROAD_COLOR);
-        BeginMode3D(client->camera);
-        handle_camera_controls(env->client);
-        draw_scene(env, client, 0, 0, 0, 0, 1, 1);
-
-        if (IsKeyPressed(KEY_TAB) && env->active_agent_count > 0) {
-            env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
-        }
-
-        DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
-        DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
-        int human_idx = env->active_agent_indices[env->human_agent_idx];
-
-        Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
-
-        if (env->action_type == 0) { // discrete
-            int *action_array = (int *)env->actions;
-            int action_val = action_array[env->human_agent_idx];
-
-            if (env->dynamics_model == CLASSIC) {
-                int num_steer = 13;
-                int accel_idx = action_val / num_steer;
-                int steer_idx = action_val % num_steer;
-                float accel_value = ACCELERATION_VALUES[accel_idx];
-                float steer_value = STEERING_VALUES[steer_idx];
-
-                DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Steering: %.3f", steer_value), 10, 130, 20, action_color);
-            } else if (env->dynamics_model == JERK) {
-                int num_lat = 3;
-                int jerk_long_idx = action_val / num_lat;
-                int jerk_lat_idx = action_val % num_lat;
-                float jerk_long_value = JERK_LONG[jerk_long_idx];
-                float jerk_lat_value = JERK_LAT[jerk_lat_idx];
-
-                DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
-            }
-        } else { // continuous
-            if (env->dynamics_model == DELTA) {
-                float (*action_array_f)[3] = (float (*)[3])env->actions;
-                DrawText(TextFormat("dX: %.2f m", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
-                         action_color);
-                DrawText(TextFormat("dY: %.2f m", action_array_f[env->human_agent_idx][1]), 10, 130, 20,
-                         action_color);
-                DrawText(TextFormat("dYaw: %.2f rad", action_array_f[env->human_agent_idx][2]), 10, 150, 20,
-                         action_color);
-            } else {
-                float (*action_array_f)[2] = (float (*)[2])env->actions;
-                DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
-                         action_color);
-                DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20,
-                         action_color);
-            }
-        }
-
-        int status_y = (env->action_type == 1 && env->dynamics_model == DELTA) ? 170 : 150;
-        if (IsKeyDown(KEY_LEFT_SHIFT)) {
-            DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-        if (IsKeyDown(KEY_SPACE)) {
-            DrawText("[space pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-        if (IsKeyDown(KEY_LEFT_CONTROL)) {
-            DrawText("[ctrl pressed]", 10, status_y, 20, YELLOW);
-            status_y += 20;
-        }
-
-        DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
-                 client->height - 30, 20, PUFF_WHITE);
-        DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
-        DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
-        EndDrawing();
     }
 }
 

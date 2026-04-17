@@ -229,6 +229,57 @@ static PyObject *env_render(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+static PyObject *env_render_rgb(PyObject *self, PyObject *args) {
+    int num_args = PyTuple_Size(args);
+    if (num_args != 4) {
+        PyErr_SetString(PyExc_TypeError, "env_render_rgb requires 4 arguments (env_handle, view_mode, draw_traces, agent_idx)");
+        return NULL;
+    }
+
+    Env *env = unpack_env(args);
+    if (!env) {
+        return NULL;
+    }
+
+    PyObject *view_mode_arg = PyTuple_GetItem(args, 1);
+    PyObject *show_traces_arg = PyTuple_GetItem(args, 2);
+    PyObject *agent_idx_arg = PyTuple_GetItem(args, 3);
+    if (!PyObject_TypeCheck(view_mode_arg, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "view_mode must be an integer");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(show_traces_arg, &PyBool_Type)) {
+        PyErr_SetString(PyExc_TypeError, "draw_traces must be a boolean");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(agent_idx_arg, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "agent_idx must be an integer");
+        return NULL;
+    }
+
+    int view_mode = PyLong_AsLong(view_mode_arg);
+    bool draw_traces = PyObject_IsTrue(show_traces_arg);
+    int agent_idx = PyLong_AsLong(agent_idx_arg);
+    int width = 0;
+    int height = 0;
+    unsigned char *pixels = c_render_rgb(env, view_mode, draw_traces, agent_idx, &width, &height);
+    if (pixels == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to capture render frame");
+        return NULL;
+    }
+
+    npy_intp dims[3] = {height, width, 4};
+    PyObject *array = PyArray_SimpleNew(3, dims, NPY_UINT8);
+    if (array == NULL) {
+        free(pixels);
+        return NULL;
+    }
+
+    memcpy(PyArray_DATA((PyArrayObject *)array), pixels, (size_t)width * height * 4);
+    free(pixels);
+    return array;
+}
+
 // Python function to close the environment
 static PyObject *env_close(PyObject *self, PyObject *args) {
     Env *env = unpack_env(args);
@@ -569,6 +620,65 @@ static PyObject *vec_render(PyObject *self, PyObject *args) {
 
     c_render(vec->envs[env_id], view_mode, draw_traces);
     Py_RETURN_NONE;
+}
+
+static PyObject *vec_render_rgb(PyObject *self, PyObject *args) {
+    int num_args = PyTuple_Size(args);
+    if (num_args != 5) {
+        PyErr_SetString(PyExc_TypeError,
+                        "vec_render_rgb requires 5 arguments (vec_handle, view_mode, draw_traces, env_id, agent_idx)");
+        return NULL;
+    }
+
+    VecEnv *vec = (VecEnv *)PyLong_AsVoidPtr(PyTuple_GetItem(args, 0));
+    if (!vec) {
+        PyErr_SetString(PyExc_ValueError, "Invalid vec_env handle");
+        return NULL;
+    }
+
+    PyObject *view_mode_arg = PyTuple_GetItem(args, 1);
+    PyObject *draw_traces_arg = PyTuple_GetItem(args, 2);
+    PyObject *env_id_arg = PyTuple_GetItem(args, 3);
+    PyObject *agent_idx_arg = PyTuple_GetItem(args, 4);
+    if (!PyObject_TypeCheck(view_mode_arg, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "view_mode must be an integer");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(draw_traces_arg, &PyBool_Type)) {
+        PyErr_SetString(PyExc_TypeError, "draw_traces must be a boolean");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(env_id_arg, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "env_id must be an integer");
+        return NULL;
+    }
+    if (!PyObject_TypeCheck(agent_idx_arg, &PyLong_Type)) {
+        PyErr_SetString(PyExc_TypeError, "agent_idx must be an integer");
+        return NULL;
+    }
+
+    int view_mode = PyLong_AsLong(view_mode_arg);
+    bool draw_traces = PyObject_IsTrue(draw_traces_arg);
+    int env_id = PyLong_AsLong(env_id_arg);
+    int agent_idx = PyLong_AsLong(agent_idx_arg);
+    int width = 0;
+    int height = 0;
+    unsigned char *pixels = c_render_rgb(vec->envs[env_id], view_mode, draw_traces, agent_idx, &width, &height);
+    if (pixels == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "Failed to capture render frame");
+        return NULL;
+    }
+
+    npy_intp dims[3] = {height, width, 4};
+    PyObject *array = PyArray_SimpleNew(3, dims, NPY_UINT8);
+    if (array == NULL) {
+        free(pixels);
+        return NULL;
+    }
+
+    memcpy(PyArray_DATA((PyArrayObject *)array), pixels, (size_t)width * height * 4);
+    free(pixels);
+    return array;
 }
 
 static int assign_to_dict(PyObject *dict, char *key, float value) {
@@ -1161,6 +1271,7 @@ static PyMethodDef methods[] = {
     {"env_reset", env_reset, METH_VARARGS, "Reset the environment"},
     {"env_step", env_step, METH_VARARGS, "Step the environment"},
     {"env_render", env_render, METH_VARARGS, "Render the environment"},
+    {"env_render_rgb", env_render_rgb, METH_VARARGS, "Render the environment and return an RGB frame"},
     {"env_close", env_close, METH_VARARGS, "Close the environment"},
     {"env_get", env_get, METH_VARARGS, "Get the environment state"},
     {"env_put", (PyCFunction)env_put, METH_VARARGS | METH_KEYWORDS, "Put stuff into env"},
@@ -1171,6 +1282,7 @@ static PyMethodDef methods[] = {
     {"vec_step", vec_step, METH_VARARGS, "Step the vector of environments"},
     {"vec_log", vec_log, METH_VARARGS, "Log the vector of environments"},
     {"vec_render", vec_render, METH_VARARGS, "Render the vector of environments"},
+    {"vec_render_rgb", vec_render_rgb, METH_VARARGS, "Render one vectorized environment and return an RGB frame"},
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
     {"vec_get_scenario_ids", vec_get_scenario_ids, METH_VARARGS, "Get scenario IDs for all envs"},
     {"get_expert_actions", get_expert_actions, METH_VARARGS, "Get current expert actions for active agents"},

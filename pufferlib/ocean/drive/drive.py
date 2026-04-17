@@ -51,6 +51,7 @@ class Drive(pufferlib.PufferEnv):
         control_mode="control_vehicles",
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
+        fixed_map_ids=None,
     ):
         # env
         self.dt = dt
@@ -98,6 +99,7 @@ class Drive(pufferlib.PufferEnv):
         self.init_mode_str = init_mode
         self.control_mode_str = control_mode
         self.map_dir = map_dir
+        self.fixed_map_ids = None if fixed_map_ids is None else [int(map_id) for map_id in fixed_map_ids]
 
         if self.control_mode_str == "control_vehicles":
             self.control_mode = 0
@@ -162,6 +164,12 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(
                 f"num_maps ({num_maps}) exceeds available maps in directory ({available_maps}). Please reduce num_maps or add more maps to resources/drive/binaries."
             )
+        if self.fixed_map_ids is not None and len(self.fixed_map_ids) == 0:
+            raise ValueError("fixed_map_ids must not be empty when provided")
+        if self.fixed_map_ids is not None:
+            for map_id in self.fixed_map_ids:
+                if map_id < 0 or map_id >= num_maps:
+                    raise ValueError(f"fixed_map_ids contains out-of-range map id {map_id} for num_maps={num_maps}")
 
         # Iterate through all maps to count total agents that can be initialized for each map
         agent_offsets, map_ids, num_envs = binding.shared(
@@ -174,6 +182,7 @@ class Drive(pufferlib.PufferEnv):
             goal_behavior=self.goal_behavior,
             goal_target_distance=self.goal_target_distance,
             max_controlled_agents=self.max_controlled_agents,
+            fixed_map_ids=self.fixed_map_ids,
         )
 
         self.num_agents = agent_offsets[-1]
@@ -243,6 +252,7 @@ class Drive(pufferlib.PufferEnv):
             goal_speed=self.goal_speed,
             map_dir=self.map_dir,
             max_controlled_agents=self.max_controlled_agents,
+            fixed_map_ids=self.fixed_map_ids,
         )
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
@@ -433,8 +443,39 @@ class Drive(pufferlib.PufferEnv):
 
         return polylines
 
-    def render(self, view_mode: RenderView = RenderView.FULL_SIM_STATE, draw_traces: bool = True, env_id: int = 0):
+    def render(
+        self,
+        view_mode: RenderView = RenderView.FULL_SIM_STATE,
+        draw_traces: bool = True,
+        env_id: int = 0,
+        agent_idx: int | None = None,
+        return_rgb: bool = False,
+    ):
+        if return_rgb:
+            capture_agent_idx = -1 if agent_idx is None else int(agent_idx)
+            return binding.vec_render_rgb(self.c_envs, int(view_mode), draw_traces, env_id, capture_agent_idx)
+
         binding.vec_render(self.c_envs, int(view_mode), draw_traces, env_id)
+
+    def render_all_controlled_agent_views(
+        self,
+        env_id: int = 0,
+        view_mode: RenderView = RenderView.AGENT_PERSP,
+        draw_traces: bool = True,
+    ):
+        start = self.agent_offsets[env_id]
+        end = self.agent_offsets[env_id + 1]
+        batch_indices = np.arange(start, end, dtype=np.int32)
+
+        frames = [
+            binding.vec_render_rgb(self.c_envs, int(view_mode), draw_traces, env_id, local_agent_idx)
+            for local_agent_idx in range(end - start)
+        ]
+
+        if len(frames) == 0:
+            return np.zeros((0, 0, 0, 4), dtype=np.uint8), batch_indices
+
+        return np.stack(frames, axis=0), batch_indices
 
     def close(self):
         binding.vec_close(self.c_envs)
