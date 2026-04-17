@@ -11,6 +11,9 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
+#if defined(__linux__)
+#include "egl_headless.h"
+#endif
 #include <time.h>
 #include "error.h"
 
@@ -2477,9 +2480,17 @@ void c_step(Drive *env) {
 
 typedef struct Client Client;
 
+static int g_client_window_refcount = 0;
+static int g_client_window_width = 0;
+static int g_client_window_height = 0;
+static int g_headless_gpu_enabled = 0;
+static pid_t g_headless_xvfb_pid = -1;
+static int g_headless_xvfb_display_num = -1;
+
 struct Client {
     float width;
     float height;
+    int use_headless_gpu;
     Texture2D puffers;
     Vector3 camera_target;
     float camera_zoom;
@@ -2488,6 +2499,7 @@ struct Client {
     Model cyclist;
     Model pedestrian;
     ModelAnimation *cycle_anim;
+    int cycle_anim_count;
     int car_assignments[MAX_AGENTS];
     Vector3 default_camera_position;
     Vector3 default_camera_target;
@@ -2533,6 +2545,8 @@ Client *make_client(Drive *env, int view_mode, int record_video) {
         }
 
         setenv("DISPLAY", ":99", 1);
+        g_headless_xvfb_pid = client->xvfb_pid;
+        g_headless_xvfb_display_num = client->xvfb_display_num;
         // Xvfb starts asynchronously after fork(), so we poll until it creates its
         // lock file (max 2s) then wait an extra 200ms for GLX to finish initializing.
         // Without this, raylib's InitWindow() would try to connect before Xvfb is ready.
@@ -2582,7 +2596,34 @@ Client *make_client(Drive *env, int view_mode, int record_video) {
     }
 
     SetTraceLogLevel(LOG_WARNING); // Only show warnings and errors
-    InitWindow(client->width, client->height, "PufferDrive");
+    if (!IsWindowReady()) {
+        InitWindow(client->width, client->height, "PufferDrive");
+        g_client_window_width = (int)client->width;
+        g_client_window_height = (int)client->height;
+
+#if defined(__linux__)
+        if (env->render_mode == RENDER_HEADLESS) {
+            if (egl_headless_init((int)client->width, (int)client->height) && egl_switch_to_gpu()) {
+                rlglClose();
+                rlglInit((int)client->width, (int)client->height);
+                g_headless_gpu_enabled = 1;
+            } else {
+                fprintf(stderr, "[drive] Falling back to CPU headless rendering\n");
+                g_headless_gpu_enabled = 0;
+            }
+        }
+#endif
+    } else {
+        if (g_client_window_width != (int)client->width || g_client_window_height != (int)client->height) {
+            fprintf(stderr, "[drive] Reusing shared render context at %dx%d for requested %dx%d\n",
+                    g_client_window_width, g_client_window_height, (int)client->width, (int)client->height);
+            client->width = g_client_window_width;
+            client->height = g_client_window_height;
+        }
+    }
+
+    client->use_headless_gpu = g_headless_gpu_enabled;
+    g_client_window_refcount++;
 
     // Load assets
     client->cars[0] = LoadModel("resources/drive/RedCar.glb");
@@ -2593,8 +2634,8 @@ Client *make_client(Drive *env, int view_mode, int record_video) {
     client->cars[5] = LoadModel("resources/drive/GreyCar.glb");
     client->cyclist = LoadModel("resources/drive/cyclist.glb");
     client->pedestrian = LoadModel("resources/drive/pedestrian.glb");
-    int animCountCyc = 0;
-    client->cycle_anim = LoadModelAnimations("resources/drive/cyclist.glb", &animCountCyc);
+    client->cycle_anim_count = 0;
+    client->cycle_anim = LoadModelAnimations("resources/drive/cyclist.glb", &client->cycle_anim_count);
     for (int i = 0; i < MAX_AGENTS; i++) {
         client->car_assignments[i] = (rand() % 4) + 1;
     }
@@ -3261,6 +3302,11 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
 
 static void render_frame(Drive *env, Client *client, int view_mode, int draw_traces) {
     if (env->render_mode == RENDER_HEADLESS) { // Headless rendering via ffmpeg or pixel capture
+#if defined(__linux__)
+        if (client->use_headless_gpu) {
+            egl_switch_to_gpu();
+        }
+#endif
         float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
 
         Camera3D camera = {0};
@@ -3341,7 +3387,15 @@ static void render_frame(Drive *env, Client *client, int view_mode, int draw_tra
                        AGENT_PERSP_SHOW_WORLD_GOALS);
         }
 
-        EndDrawing();
+        if (client->use_headless_gpu) {
+            // EndDrawing() swaps the hidden GLFW window backbuffer, which
+            // re-enters GLX and crashes after we've redirected rendering to
+            // the EGL pbuffer. For GPU headless mode we only need to flush the
+            // queued rlgl commands before readback.
+            rlDrawRenderBatchActive();
+        } else {
+            EndDrawing();
+        }
         return;
     }
 
@@ -3493,12 +3547,36 @@ void close_client(Client *client) {
         UnloadModel(client->cars[i]);
     UnloadModel(client->cyclist);
     UnloadModel(client->pedestrian);
-    CloseWindow();
-    if (client->xvfb_pid > 0) {
-        kill(client->xvfb_pid, SIGTERM);
-        waitpid(client->xvfb_pid, NULL, 0);
-        unlink("/tmp/.X99-lock");
-        unsetenv("DISPLAY");
+    if (client->cycle_anim != NULL && client->cycle_anim_count > 0) {
+        UnloadModelAnimations(client->cycle_anim, client->cycle_anim_count);
+    }
+
+    if (g_client_window_refcount > 0) {
+        g_client_window_refcount--;
+    }
+
+    if (g_client_window_refcount == 0) {
+#if defined(__linux__)
+        if (client->use_headless_gpu) {
+            egl_headless_cleanup();
+            g_headless_gpu_enabled = 0;
+        }
+#endif
+        if (IsWindowReady() && !client->use_headless_gpu) {
+            CloseWindow();
+        } else if (client->use_headless_gpu) {
+            fprintf(stderr, "[drive] Skipping CloseWindow after EGL headless rendering\n");
+        }
+        if (g_headless_xvfb_pid > 0) {
+            kill(g_headless_xvfb_pid, SIGTERM);
+            waitpid(g_headless_xvfb_pid, NULL, 0);
+            unlink("/tmp/.X99-lock");
+            unsetenv("DISPLAY");
+            g_headless_xvfb_pid = -1;
+            g_headless_xvfb_display_num = -1;
+        }
+        g_client_window_width = 0;
+        g_client_window_height = 0;
     }
 
     free(client);

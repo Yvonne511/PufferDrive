@@ -163,6 +163,7 @@ if system == "Linux":
     ]
     extra_link_args += [
         "-Bsymbolic-functions",
+        "-ldl",
     ]
     if not NO_OCEAN:
         download_raylib("raylib-5.5_linux_amd64", ".tar.gz")
