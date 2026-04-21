@@ -489,6 +489,37 @@ class Drive(pufferlib.PufferEnv):
         """Get log statistics for all environments (unaggregated)."""
         return [self.env_log(i) for i in range(self.num_envs)]
 
+    def get_reward_components(self, env_id=None):
+        """Get per-agent reward components.
+
+        Args:
+            env_id: if given, return components only for that env; otherwise all envs.
+
+        Returns a dict with float32 arrays:
+          - alignment_angle: heading difference vs nearest lane in radians (-1 if no lane)
+          - distance_to_center: distance to nearest lane centerline in meters (-1 if none)
+          - collision: 1.0 if vehicle collision this step, 0.0 otherwise
+          - offroad: 1.0 if offroad this step, 0.0 otherwise
+        """
+        num_agents = self.num_agents
+        components = {
+            "alignment_angle": np.zeros(num_agents, dtype=np.float32),
+            "distance_to_center": np.zeros(num_agents, dtype=np.float32),
+            "collision": np.zeros(num_agents, dtype=np.float32),
+            "offroad": np.zeros(num_agents, dtype=np.float32),
+        }
+        binding.vec_get_reward_components(
+            self.c_envs,
+            components["alignment_angle"],
+            components["distance_to_center"],
+            components["collision"],
+            components["offroad"],
+        )
+        if env_id is not None:
+            start, end = self.agent_offsets[env_id], self.agent_offsets[env_id + 1]
+            components = {k: v[start:end] for k, v in components.items()}
+        return components
+
     @property
     def scenario_ids(self) -> list[str]:
         """Return scenario ID string for each env, stripping null padding."""

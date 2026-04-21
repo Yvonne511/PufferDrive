@@ -29,8 +29,10 @@
 // Headless agent-perspective render settings.
 // These only apply when the first headless render call uses VIEW_MODE_AGENT_PERSP.
 #define AGENT_PERSP_HEADLESS_USE_FIXED_VIEWPORT 1
-#define AGENT_PERSP_HEADLESS_WIDTH 720
-#define AGENT_PERSP_HEADLESS_HEIGHT 720
+// #define AGENT_PERSP_HEADLESS_WIDTH 720
+// #define AGENT_PERSP_HEADLESS_HEIGHT 720
+#define AGENT_PERSP_HEADLESS_WIDTH 256
+#define AGENT_PERSP_HEADLESS_HEIGHT 256
 #define AGENT_PERSP_SHOW_GRID 0
 #define AGENT_PERSP_SHOW_OBS_OVERLAY 0
 #define AGENT_PERSP_SHOW_WORLD_GOALS 0
@@ -255,6 +257,8 @@ struct Entity {
     float heading_x;
     float heading_y;
     int current_lane_idx;
+    float distance_to_center; // raw geometric distance to nearest lane centerline (-1 if none)
+    float alignment_angle;    // heading difference vs nearest lane in radians (-1 if none)
     int valid;
     int respawn_timestep;
     int respawn_count;
@@ -1185,6 +1189,7 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     float cos_heading = cosf(agent->heading);
     float sin_heading = sinf(agent->heading);
     float min_distance = (float)INT16_MAX;
+    float min_raw_distance = (float)INT16_MAX;
 
     int closest_lane_entity_idx = -1;
     int closest_lane_geometry_idx = -1;
@@ -1233,7 +1238,8 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
 
-            float dist = point_to_segment_distance_2d(agent->x, agent->y, start[0], start[1], end[0], end[1]);
+            float raw_dist = point_to_segment_distance_2d(agent->x, agent->y, start[0], start[1], end[0], end[1]);
+            float dist = raw_dist;
             float heading_diff = fabsf(atan2f(end[1] - start[1], end[0] - start[0]) - agent->heading);
 
             // Normalize heading difference to [0, pi]
@@ -1246,6 +1252,7 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
 
             if (dist < min_distance) {
                 min_distance = dist;
+                min_raw_distance = raw_dist;
                 closest_lane_entity_idx = entity_idx;
                 closest_lane_geometry_idx = geometry_idx;
             }
@@ -1257,10 +1264,36 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
         agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
         agent->current_lane_idx = -1;
+        agent->distance_to_center = -1.0f;
+        agent->alignment_angle = -1.0f;
     } else {
         agent->current_lane_idx = closest_lane_entity_idx;
+        agent->distance_to_center = min_raw_distance;
+
+        // Compute alignment angle using same averaged-heading logic as check_lane_aligned
+        Entity *closest_lane = &env->entities[closest_lane_entity_idx];
+        int geom = closest_lane_geometry_idx;
+        if (geom < 0) geom = 0;
+        if (geom >= closest_lane->array_size - 1) geom = closest_lane->array_size - 2;
+        float hx1, hy1;
+        if (geom > 0) {
+            hx1 = closest_lane->traj_x[geom] - closest_lane->traj_x[geom - 1];
+            hy1 = closest_lane->traj_y[geom] - closest_lane->traj_y[geom - 1];
+        } else {
+            hx1 = closest_lane->traj_x[geom + 1] - closest_lane->traj_x[geom];
+            hy1 = closest_lane->traj_y[geom + 1] - closest_lane->traj_y[geom];
+        }
+        float hx2 = closest_lane->traj_x[geom + 1] - closest_lane->traj_x[geom];
+        float hy2 = closest_lane->traj_y[geom + 1] - closest_lane->traj_y[geom];
+        float lane_heading = (atan2f(hy1, hx1) + atan2f(hy2, hx2)) / 2.0f;
+        if (lane_heading > M_PI) lane_heading -= 2.0f * M_PI;
+        if (lane_heading < -M_PI) lane_heading += 2.0f * M_PI;
+        float angle_diff = fabsf(agent->heading - lane_heading);
+        if (angle_diff > M_PI) angle_diff = 2.0f * M_PI - angle_diff;
+        agent->alignment_angle = angle_diff;
+
         int lane_aligned =
-            check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
+            check_lane_aligned(agent, closest_lane, closest_lane_geometry_idx);
         agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
     }
 
@@ -2282,6 +2315,17 @@ void sample_new_goal(Drive *env, int agent_idx) {
     agent->goal_position_x = best_x;
     agent->goal_position_y = best_y;
     agent->goals_sampled_this_episode += 1;
+}
+
+void c_get_reward_components(Drive *env, float *alignment_angle_out, float *distance_to_center_out,
+                             float *collision_out, float *offroad_out) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int agent_idx = env->active_agent_indices[i];
+        alignment_angle_out[i] = env->entities[agent_idx].alignment_angle;
+        distance_to_center_out[i] = env->entities[agent_idx].distance_to_center;
+        collision_out[i] = (env->entities[agent_idx].collision_state == VEHICLE_COLLISION) ? 1.0f : 0.0f;
+        offroad_out[i] = env->entities[agent_idx].metrics_array[OFFROAD_IDX];
+    }
 }
 
 void c_reset(Drive *env) {
@@ -3492,26 +3536,14 @@ unsigned char *c_render_rgb(Drive *env, int view_mode, int draw_traces, int agen
 
     render_frame(env, client, view_mode, draw_traces);
 
-    unsigned char *screen_data = rlReadScreenPixels((int)client->width, (int)client->height);
-    if (screen_data == NULL) {
-        env->human_agent_idx = prev_human_agent_idx;
-        return NULL;
-    }
-
     int width = (int)client->width;
     int height = (int)client->height;
-    size_t num_bytes = (size_t)width * height * 4;
-    unsigned char *pixels = (unsigned char *)malloc(num_bytes);
+    unsigned char *pixels = rlReadScreenPixels(width, height);
+    env->human_agent_idx = prev_human_agent_idx;
+
     if (pixels == NULL) {
-        RL_FREE(screen_data);
-        env->human_agent_idx = prev_human_agent_idx;
         return NULL;
     }
-
-    memcpy(pixels, screen_data, num_bytes);
-
-    RL_FREE(screen_data);
-    env->human_agent_idx = prev_human_agent_idx;
 
     if (width_out != NULL)
         *width_out = width;

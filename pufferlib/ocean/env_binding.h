@@ -1,6 +1,11 @@
 #include "env_config.h"
 #include <Python.h>
 #include <numpy/arrayobject.h>
+#include <stdlib.h>
+
+#ifndef RL_FREE
+#define RL_FREE free
+#endif
 
 // Forward declarations for env-specific functions supplied by user
 static int my_log(PyObject *dict, Log *log);
@@ -39,6 +44,37 @@ static Env *unpack_env(PyObject *args) {
     }
 
     return env;
+}
+
+static void free_render_pixels_capsule(PyObject *capsule) {
+    void *pixels = PyCapsule_GetPointer(capsule, "render_pixels");
+    if (pixels != NULL) {
+        RL_FREE(pixels);
+    }
+}
+
+static PyObject *wrap_render_pixels(unsigned char *pixels, int width, int height) {
+    npy_intp dims[3] = {height, width, 4};
+    PyObject *array = PyArray_SimpleNewFromData(3, dims, NPY_UINT8, pixels);
+    if (array == NULL) {
+        RL_FREE(pixels);
+        return NULL;
+    }
+
+    PyObject *capsule = PyCapsule_New(pixels, "render_pixels", free_render_pixels_capsule);
+    if (capsule == NULL) {
+        Py_DECREF(array);
+        RL_FREE(pixels);
+        return NULL;
+    }
+
+    if (PyArray_SetBaseObject((PyArrayObject *)array, capsule) < 0) {
+        Py_DECREF(capsule);
+        Py_DECREF(array);
+        return NULL;
+    }
+
+    return array;
 }
 
 // Python function to initialize the environment
@@ -267,17 +303,7 @@ static PyObject *env_render_rgb(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to capture render frame");
         return NULL;
     }
-
-    npy_intp dims[3] = {height, width, 4};
-    PyObject *array = PyArray_SimpleNew(3, dims, NPY_UINT8);
-    if (array == NULL) {
-        free(pixels);
-        return NULL;
-    }
-
-    memcpy(PyArray_DATA((PyArrayObject *)array), pixels, (size_t)width * height * 4);
-    free(pixels);
-    return array;
+    return wrap_render_pixels(pixels, width, height);
 }
 
 // Python function to close the environment
@@ -668,17 +694,7 @@ static PyObject *vec_render_rgb(PyObject *self, PyObject *args) {
         PyErr_SetString(PyExc_RuntimeError, "Failed to capture render frame");
         return NULL;
     }
-
-    npy_intp dims[3] = {height, width, 4};
-    PyObject *array = PyArray_SimpleNew(3, dims, NPY_UINT8);
-    if (array == NULL) {
-        free(pixels);
-        return NULL;
-    }
-
-    memcpy(PyArray_DATA((PyArrayObject *)array), pixels, (size_t)width * height * 4);
-    free(pixels);
-    return array;
+    return wrap_render_pixels(pixels, width, height);
 }
 
 static int assign_to_dict(PyObject *dict, char *key, float value) {
@@ -1264,6 +1280,71 @@ static char *unpack_str(PyObject *kwargs, char *key) {
     return ret;
 }
 
+static PyObject *get_reward_components(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 5) {
+        PyErr_SetString(PyExc_TypeError, "get_reward_components requires 5 arguments");
+        return NULL;
+    }
+
+    Env *env = unpack_env(args);
+    if (!env) return NULL;
+
+    PyObject *aa_arr  = PyTuple_GetItem(args, 1);
+    PyObject *dtc_arr = PyTuple_GetItem(args, 2);
+    PyObject *col_arr = PyTuple_GetItem(args, 3);
+    PyObject *off_arr = PyTuple_GetItem(args, 4);
+
+    if (!PyArray_Check(aa_arr) || !PyArray_Check(dtc_arr) ||
+        !PyArray_Check(col_arr) || !PyArray_Check(off_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *aa  = (float *)PyArray_DATA((PyArrayObject *)aa_arr);
+    float *dtc = (float *)PyArray_DATA((PyArrayObject *)dtc_arr);
+    float *col = (float *)PyArray_DATA((PyArrayObject *)col_arr);
+    float *off = (float *)PyArray_DATA((PyArrayObject *)off_arr);
+
+    c_get_reward_components((Drive *)env, aa, dtc, col, off);
+    Py_RETURN_NONE;
+}
+
+static PyObject *vec_get_reward_components(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 5) {
+        PyErr_SetString(PyExc_TypeError, "vec_get_reward_components requires 5 arguments");
+        return NULL;
+    }
+
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec) return NULL;
+
+    PyObject *aa_arr  = PyTuple_GetItem(args, 1);
+    PyObject *dtc_arr = PyTuple_GetItem(args, 2);
+    PyObject *col_arr = PyTuple_GetItem(args, 3);
+    PyObject *off_arr = PyTuple_GetItem(args, 4);
+
+    if (!PyArray_Check(aa_arr) || !PyArray_Check(dtc_arr) ||
+        !PyArray_Check(col_arr) || !PyArray_Check(off_arr)) {
+        PyErr_SetString(PyExc_TypeError, "All output arrays must be NumPy arrays");
+        return NULL;
+    }
+
+    float *aa_base  = (float *)PyArray_DATA((PyArrayObject *)aa_arr);
+    float *dtc_base = (float *)PyArray_DATA((PyArrayObject *)dtc_arr);
+    float *col_base = (float *)PyArray_DATA((PyArrayObject *)col_arr);
+    float *off_base = (float *)PyArray_DATA((PyArrayObject *)off_arr);
+
+    int offset = 0;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        c_get_reward_components(drive, &aa_base[offset], &dtc_base[offset],
+                                &col_base[offset], &off_base[offset]);
+        offset += drive->active_agent_count;
+    }
+
+    Py_RETURN_NONE;
+}
+
 // Method table
 static PyMethodDef methods[] = {
     {"env_init", (PyCFunction)env_init, METH_VARARGS | METH_KEYWORDS,
@@ -1298,6 +1379,10 @@ static PyMethodDef methods[] = {
      "Get road edge polyline counts from vectorized env"},
     {"vec_get_road_edge_polylines", vec_get_road_edge_polylines, METH_VARARGS,
      "Get road edge polylines from vectorized env"},
+    {"get_reward_components", get_reward_components, METH_VARARGS,
+     "Get per-agent reward components (alignment_angle, distance_to_center, collision, offroad)"},
+    {"vec_get_reward_components", vec_get_reward_components, METH_VARARGS,
+     "Get per-agent reward components from vectorized env"},
     MY_METHODS,
     {NULL, NULL, 0, NULL}};
 
