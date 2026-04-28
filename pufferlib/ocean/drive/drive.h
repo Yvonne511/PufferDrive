@@ -34,6 +34,20 @@
 #define AGENT_PERSP_HEADLESS_WIDTH 256
 #define AGENT_PERSP_HEADLESS_HEIGHT 256
 #define AGENT_PERSP_SHOW_GRID 0
+
+// BEV observation render settings.
+// The BEV renders into a larger internal texture (BEV_RENDER_SCALE x 256) at the same
+// world-unit fovy, giving BEV_RENDER_SCALE x more pixels per world unit.  The top-center
+// 256x256 crop is returned as the observation, placing the vehicle at bottom-center so
+// the agent sees what is ahead of it.
+#define BEV_OBS_WIDTH 256
+#define BEV_OBS_HEIGHT 256
+#define BEV_RENDER_SCALE 2
+#define BEV_RENDER_WIDTH (BEV_OBS_WIDTH * BEV_RENDER_SCALE)
+#define BEV_RENDER_HEIGHT (BEV_OBS_HEIGHT * BEV_RENDER_SCALE)
+// How many pixels below the vehicle center to include at the bottom of the BEV output.
+// Increase to show more behind the vehicle; 0 puts the vehicle at the very last row.
+#define BEV_EGO_OFFSET 16
 #define AGENT_PERSP_SHOW_OBS_OVERLAY 0
 #define AGENT_PERSP_SHOW_WORLD_GOALS 0
 
@@ -2552,6 +2566,7 @@ struct Client {
     pid_t xvfb_pid;
     int xvfb_display_num;
     int record_video;
+    RenderTexture2D bev_texture; // off-screen FBO for BEV_AGENT_OBS, independent of window size
 };
 
 Client *make_client(Drive *env, int view_mode, int record_video) {
@@ -2625,6 +2640,11 @@ Client *make_client(Drive *env, int view_mode, int record_video) {
         SetTargetFPS(6000);
 
         if (view_mode == VIEW_MODE_AGENT_PERSP && AGENT_PERSP_HEADLESS_USE_FIXED_VIEWPORT) {
+            client->width = AGENT_PERSP_HEADLESS_WIDTH;
+            client->height = AGENT_PERSP_HEADLESS_HEIGHT;
+        } else if (view_mode == VIEW_MODE_BEV_AGENT_OBS) {
+            // BEV renders into its own off-screen texture (see render_frame), so the window
+            // only needs to be large enough for the shared GL context to function.
             client->width = AGENT_PERSP_HEADLESS_WIDTH;
             client->height = AGENT_PERSP_HEADLESS_HEIGHT;
         } else {
@@ -3301,7 +3321,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
             else if (env->entities[i].type == DRIVEWAY)
                 lineColor = RED;
 
-            if (!IsKeyDown(KEY_LEFT_CONTROL) && obs_only == 0) {
+            if (!IsKeyDown(KEY_LEFT_CONTROL)) {
                 if (env->entities[i].type == ROAD_EDGE) {
                     draw_road_edge(env, start.x, start.y, end.x, end.y);
                 } else if (env->entities[i].type == ROAD_LANE || env->entities[i].type == ROAD_LINE) {
@@ -3401,16 +3421,27 @@ static void render_frame(Drive *env, Client *client, int view_mode, int draw_tra
             int agent_idx = env->active_agent_indices[env->human_agent_idx];
             Entity *agent = &env->entities[agent_idx];
 
+            float ego_heading = agent->heading;
             camera.position = (Vector3){agent->x, agent->y, 400.0f};
             camera.target = (Vector3){agent->x, agent->y, 0.0f};
-            camera.up = (Vector3){0.0f, -1.0f, 0.0f};
+            camera.up = (Vector3){cosf(ego_heading), sinf(ego_heading), 0.0f};
             camera.projection = CAMERA_ORTHOGRAPHIC;
-            camera.fovy = env->grid_map->vision_range * GRID_CELL_SIZE * 2.0f;
+            // camera.fovy = env->grid_map->vision_range * GRID_CELL_SIZE * 2.0f;
+            camera.fovy = 210.0f;
 
-            BeginDrawing();
+            // Lazily create an off-screen render texture sized to the observation footprint.
+            // This is independent of the shared window size so BEV always gets the right resolution
+            // even when a smaller window was already created for AGENT_PERSP.
+            if (client->bev_texture.id == 0) {
+                client->bev_texture = LoadRenderTexture(BEV_RENDER_WIDTH, BEV_RENDER_HEIGHT);
+            }
+
+            BeginTextureMode(client->bev_texture);
             ClearBackground(ROAD_COLOR);
             BeginMode3D(camera);
-            draw_scene(env, client, 1, 1, 0, 0, 1, 1);
+            draw_scene(env, client, 1, 1, 0, 0, 1, 0);
+            EndTextureMode();
+            return;
 
         } else { // First-person perspective from a selected agent
             int agent_idx = env->active_agent_indices[env->human_agent_idx];
@@ -3455,7 +3486,6 @@ static void render_frame(Drive *env, Client *client, int view_mode, int draw_tra
 
     DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
     DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
-    int human_idx = env->active_agent_indices[env->human_agent_idx];
 
     Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
 
@@ -3536,9 +3566,38 @@ unsigned char *c_render_rgb(Drive *env, int view_mode, int draw_traces, int agen
 
     render_frame(env, client, view_mode, draw_traces);
 
-    int width = (int)client->width;
-    int height = (int)client->height;
-    unsigned char *pixels = rlReadScreenPixels(width, height);
+    int width, height;
+    unsigned char *pixels;
+
+    if (view_mode == VIEW_MODE_BEV_AGENT_OBS && client->bev_texture.id != 0) {
+        // Read from the off-screen BEV render texture.
+        // Raylib render textures are Y-flipped relative to screen convention, so flip back.
+        Image img = LoadImageFromTexture(client->bev_texture.texture);
+        ImageFlipVertical(&img);
+        // Crop to BEV_OBS_WIDTH x BEV_OBS_HEIGHT with vehicle at bottom-center.
+        // After flip, row 0 = ahead of vehicle (camera.up == heading direction) and
+        // the vehicle sits at row BEV_RENDER_HEIGHT/2 in the full image.
+        // y_start shifts the crop so the vehicle lands at (BEV_OBS_HEIGHT - BEV_EGO_OFFSET)
+        // from the top, i.e. BEV_EGO_OFFSET pixels from the very bottom.
+        int bev_crop_y = (BEV_RENDER_HEIGHT / 2) - (BEV_OBS_HEIGHT - BEV_EGO_OFFSET);
+        Rectangle crop_rect = {
+            (BEV_RENDER_WIDTH - BEV_OBS_WIDTH) / 2.0f,
+            (float)bev_crop_y,
+            (float)BEV_OBS_WIDTH,
+            (float)BEV_OBS_HEIGHT,
+        };
+        ImageCrop(&img, crop_rect);
+        width = img.width;
+        height = img.height;
+        pixels = (unsigned char *)RL_MALLOC(width * height * 4);
+        memcpy(pixels, img.data, (size_t)(width * height * 4));
+        UnloadImage(img);
+    } else {
+        width = (int)client->width;
+        height = (int)client->height;
+        pixels = rlReadScreenPixels(width, height);
+    }
+
     env->human_agent_idx = prev_human_agent_idx;
 
     if (pixels == NULL) {
